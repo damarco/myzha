@@ -443,6 +443,11 @@ class ZhaNodeEntity(entity.Entity):
         self._device_state_attributes['battery'] = '%s%%' % (percent, )
 
     @property
+    def hidden(self) -> bool:
+        """Hide by default."""
+        return True
+
+    @property
     def device_state_attributes(self):
         """Return device specific state attributes."""
         return self._device_state_attributes
