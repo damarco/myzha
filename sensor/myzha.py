@@ -7,10 +7,9 @@ at https://home-assistant.io/components/sensor.zha/
 import asyncio
 import logging
 from datetime import timedelta
-import datetime
 
-from homeassistant.components.sensor import DOMAIN
 from custom_components import myzha as zha
+from homeassistant.components.sensor import DOMAIN
 from homeassistant.const import TEMP_CELSIUS
 from homeassistant.util.temperature import convert as convert_temperature
 
@@ -20,6 +19,7 @@ DEPENDENCIES = ['myzha']
 
 SCAN_INTERVAL = timedelta(seconds=120)
 
+
 @asyncio.coroutine
 def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
     """Set up Zigbee Home Automation sensors."""
@@ -28,7 +28,7 @@ def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
         return
 
     sensor = yield from make_sensor(discovery_info)
-    async_add_devices([sensor])
+    async_add_devices([sensor], update_before_add=True)
 
 
 @asyncio.coroutine
@@ -37,8 +37,8 @@ def make_sensor(discovery_info):
     from bellows.zigbee.zcl.clusters.measurement import TemperatureMeasurement
     from bellows.zigbee.zcl.clusters.measurement import PressureMeasurement
     from bellows.zigbee.zcl.clusters.measurement import RelativeHumidity
-    from bellows.zigbee.zcl.clusters.manufacturer_specific import SmartthingsRelativeHumidity
-    from bellows.zigbee.zcl.clusters.general import PowerConfiguration
+    from bellows.zigbee.zcl.clusters.manufacturer_specific \
+        import SmartthingsRelativeHumidity
     in_clusters = discovery_info['in_clusters']
     if TemperatureMeasurement.cluster_id in in_clusters:
         sensor = TemperatureSensor(**discovery_info)
@@ -48,11 +48,6 @@ def make_sensor(discovery_info):
         sensor = RelativeHumiditySensor(**discovery_info)
     elif SmartthingsRelativeHumidity.cluster_id in in_clusters:
         sensor = RelativeHumiditySensor(**discovery_info)
-#    elif PowerConfiguration.cluster_id in in_clusters:
-#        sensor = BatteryVoltageSensor(**discovery_info)
-#    elif PowerConfiguration.cluster_id in in_clusters \
-#            and discovery_info['manufacturer'] == 'CentraLite':
-#        sensor = CentraliteBatterySensor(**discovery_info)
     else:
         sensor = Sensor(**discovery_info)
 
@@ -76,6 +71,11 @@ class Sensor(zha.Entity):
     min_reportable_change = 1
 
     @property
+    def should_poll(self) -> bool:
+        """State gets pushed from device."""
+        return False
+
+    @property
     def state(self) -> str:
         """Return the state of the entity."""
         if isinstance(self._state, float):
@@ -94,12 +94,12 @@ class Sensor(zha.Entity):
     @asyncio.coroutine
     def async_update(self):
         """Handle polling."""
-        if self._state == 'unknown':
-            cluster = list(self._in_clusters.values())[0]
-            try:
-                yield from cluster.read_attributes([self.value_attribute])
-            except:
-                _LOGGER.info("Failed to read attribute: %s %s %s", self, cluster, self.value_attribute) 
+        _LOGGER.info("async_update called")
+        result = yield from zha.safe_read(
+            list(self._in_clusters.values())[0],
+            [self.value_attribute])
+        self._state = result.get(self.value_attribute, self._state)
+        _LOGGER.info("async_update result: %s", self._state)
 
 
 class TemperatureSensor(Sensor):
@@ -140,10 +140,6 @@ class PressureSensor(Sensor):
             return 'unknown'
         return round(float(self._state))
 
-    @asyncio.coroutine
-    def async_update(self):
-        """No response for read attribute."""
-
 
 class RelativeHumiditySensor(Sensor):
     """ZHA relative humidity sensor."""
@@ -162,10 +158,6 @@ class RelativeHumiditySensor(Sensor):
         if self._state == 'unknown':
             return 'unknown'
         return round(float(self._state) / 100)
-
-    @asyncio.coroutine
-    def async_update(self):
-        """No response for read attribute."""
 
 
 class BatteryVoltageSensor(Sensor):

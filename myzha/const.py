@@ -2,6 +2,7 @@
 
 DEVICE_CLASS = {}
 SINGLE_CLUSTER_DEVICE_CLASS = {}
+XIAOMI_SINGLE_CLUSTER_DEVICE_CLASS = {}
 COMPONENT_CLUSTERS = {}
 
 
@@ -41,8 +42,12 @@ def populate_data():
         zcl.clusters.measurement.PressureMeasurement: 'sensor',
         zcl.clusters.measurement.RelativeHumidity: 'sensor',
         zcl.clusters.security.IasZone: 'binary_sensor',
-        zcl.clusters.manufacturer_specific.SmartthingsRelativeHumidity: 'sensor',
-#        zcl.clusters.general.PowerConfiguration: 'sensor',
+        zcl.clusters.manufacturer_specific.SmartthingsRelativeHumidity:
+            'sensor',
+    })
+
+    XIAOMI_SINGLE_CLUSTER_DEVICE_CLASS.update({
+        zcl.clusters.general.OnOff: 'binary_sensor',
     })
 
     # A map of hass components to all Zigbee clusters it could use

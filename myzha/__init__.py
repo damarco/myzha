@@ -5,6 +5,7 @@ For more details about this component, please refer to the documentation at
 https://home-assistant.io/components/zha/
 """
 import asyncio
+import collections
 import logging
 import datetime
 
@@ -37,7 +38,7 @@ CONFIG_SCHEMA = vol.Schema({
     DOMAIN: vol.Schema({
         CONF_USB_PATH: cv.string,
         vol.Optional(CONF_BAUDRATE, default=57600): cv.positive_int,
-        vol.Optional(CONF_CHANNEL, default=15): 
+        vol.Optional(CONF_CHANNEL, default=15):
             vol.All(vol.Coerce(int), vol.Range(11, 26)),
         CONF_DATABASE: cv.string,
         vol.Optional(CONF_DEVICE_CONFIG, default={}):
@@ -46,23 +47,17 @@ CONFIG_SCHEMA = vol.Schema({
 }, extra=vol.ALLOW_EXTRA)
 
 ATTR_DURATION = 'duration'
+ATTR_IEEE = 'ieee_address'
 
 SERVICE_PERMIT = 'permit'
-SERVICE_DESCRIPTIONS = {
-    SERVICE_PERMIT: {
-        "description": "Allow nodes to join the ZigBee network",
-        "fields": {
-            ATTR_DURATION: {
-                "description": "Time to permit joins, in seconds",
-                "example": "60",
-            },
-        },
-    },
-}
+SERVICE_REMOVE = 'remove'
 SERVICE_SCHEMAS = {
     SERVICE_PERMIT: vol.Schema({
         vol.Optional(ATTR_DURATION, default=60):
             vol.All(vol.Coerce(int), vol.Range(1, 254)),
+    }),
+    SERVICE_REMOVE: vol.Schema({
+        vol.Required(ATTR_IEEE): cv.string,
     }),
 }
 
@@ -93,6 +88,8 @@ def async_setup(hass, config):
     import bellows.ezsp
     from bellows.zigbee.application import ControllerApplication
 
+    component = EntityComponent(_LOGGER, DOMAIN, hass)
+
     ezsp_ = bellows.ezsp.EZSP()
     usb_path = config[DOMAIN].get(CONF_USB_PATH)
     baudrate = config[DOMAIN].get(CONF_BAUDRATE)
@@ -101,7 +98,7 @@ def async_setup(hass, config):
 
     database = config[DOMAIN].get(CONF_DATABASE)
     APPLICATION_CONTROLLER = ControllerApplication(ezsp_, database)
-    listener = ApplicationListener(hass, config)
+    listener = ApplicationListener(hass, config, component)
     APPLICATION_CONTROLLER.add_listener(listener)
     yield from APPLICATION_CONTROLLER.startup(auto_form=True, channel=channel)
 
@@ -116,8 +113,19 @@ def async_setup(hass, config):
         yield from APPLICATION_CONTROLLER.permit(duration)
 
     hass.services.async_register(DOMAIN, SERVICE_PERMIT, permit,
-                                 SERVICE_DESCRIPTIONS[SERVICE_PERMIT],
-                                 SERVICE_SCHEMAS[SERVICE_PERMIT])
+                                 schema=SERVICE_SCHEMAS[SERVICE_PERMIT])
+
+    @asyncio.coroutine
+    def remove(service):
+        """Remove a node from the network."""
+        from bellows.types import EmberEUI64, uint8_t
+        ieee = service.data.get(ATTR_IEEE)
+        ieee = EmberEUI64([uint8_t(p, base=16) for p in ieee.split(':')])
+        _LOGGER.info("Removing node %s", ieee)
+        yield from APPLICATION_CONTROLLER.remove(ieee)
+
+    hass.services.async_register(DOMAIN, SERVICE_REMOVE, remove,
+                                 schema=SERVICE_SCHEMAS[SERVICE_REMOVE])
 
     return True
 
@@ -125,10 +133,12 @@ def async_setup(hass, config):
 class ApplicationListener:
     """All handlers for events that happen on the ZigBee application."""
 
-    def __init__(self, hass, config):
+    def __init__(self, hass, config, component):
         """Initialize the listener."""
         self._hass = hass
         self._config = config
+        self._component = component
+        self._device_registry = collections.defaultdict(list)
         hass.data[DISCOVERY_KEY] = hass.data.get(DISCOVERY_KEY, {})
         hass.data[NODE_ENTITY_KEY] = hass.data.get(NODE_ENTITY_KEY, {})
 
@@ -151,7 +161,8 @@ class ApplicationListener:
 
     def device_removed(self, device):
         """Handle device being removed from the network."""
-        pass
+        for device_entity in self._device_registry[device.ieee]:
+            self._hass.async_add_job(device_entity.async_remove())
 
     @asyncio.coroutine
     def async_device_initialized(self, device, join):
@@ -200,6 +211,7 @@ class ApplicationListener:
                                 for c in profile_clusters[1]
                                 if c in endpoint.out_clusters]
                 discovery_info = {
+                    'application_listener': self,
                     'endpoint': endpoint,
                     'in_clusters': {c.cluster_id: c for c in in_clusters},
                     'out_clusters': {c.cluster_id: c for c in out_clusters},
@@ -224,12 +236,21 @@ class ApplicationListener:
                     continue
 
                 component = zha_const.SINGLE_CLUSTER_DEVICE_CLASS[cluster_type]
+
+                if (discovered_info['manufacturer'] == XIAOMI and
+                        cluster_type in
+                        zha_const.XIAOMI_SINGLE_CLUSTER_DEVICE_CLASS):
+                    component = zha_const.XIAOMI_SINGLE_CLUSTER_DEVICE_CLASS[
+                        cluster_type]
+
                 discovery_info = {
+                    'application_listener': self,
                     'endpoint': endpoint,
                     'in_clusters': {cluster.cluster_id: cluster},
                     'out_clusters': {},
                     'new_join': join,
                 }
+
                 discovery_info.update(discovered_info)
                 cluster_key = '%s-%s' % (device_key, cluster_id)
                 self._hass.data[DISCOVERY_KEY][cluster_key] = discovery_info
@@ -242,7 +263,6 @@ class ApplicationListener:
                     self._config,
                 )
 
-            component = EntityComponent(_LOGGER, DOMAIN, self._hass)
             in_cluster = {}
             out_cluster = {}
             # Add cluster 0 to node entity for xiaomi device (heartbeat)
@@ -251,9 +271,20 @@ class ApplicationListener:
             # Add cluster 1 to node entity for centralite device (power)
             if discovered_info['manufacturer'] == CENTRALITE:
                 in_cluster[1] = endpoint.in_clusters[1]
-            node_entity = ZhaNodeEntity(endpoint, in_cluster, out_cluster, discovered_info['manufacturer'], discovered_info['model'])
-            yield from component.async_add_entity(node_entity)
-            self._hass.data[NODE_ENTITY_KEY][endpoint.device.ieee] = node_entity
+            node_entity = ZhaNodeEntity(
+                endpoint,
+                in_cluster,
+                out_cluster,
+                discovered_info['manufacturer'],
+                discovered_info['model'],
+                self)
+            yield from self._component.async_add_entities([node_entity])
+            self._hass.data[NODE_ENTITY_KEY][endpoint.device.ieee] = \
+                node_entity
+
+    def register_entity(self, ieee, entity):
+        """Record the creation of a hass entity associated with ieee."""
+        self._device_registry[ieee].append(entity)
 
 
 class Entity(entity.Entity):
@@ -263,7 +294,7 @@ class Entity(entity.Entity):
     friendly_name = "ZHA"
 
     def __init__(self, endpoint, in_clusters, out_clusters, manufacturer,
-                 model, **kwargs):
+                 model, application_listener, **kwargs):
         """Init ZHA entity."""
         self._device_state_attributes = {}
         ieeetail = ''.join([
@@ -311,6 +342,7 @@ class Entity(entity.Entity):
         self._out_clusters = out_clusters
         self._state = ha_const.STATE_UNKNOWN
 
+        application_listener.register_entity(self._ieee, self)
 
     def attribute_updated(self, attribute, value):
         """Handle an attribute updated on this cluster."""
@@ -325,13 +357,16 @@ class Entity(entity.Entity):
         """Return device specific state attributes."""
         return self._device_state_attributes
 
+
 class ZhaNodeEntity(entity.Entity):
     """A base class for ZHA nodes."""
 
     _domain = "zha"
+    _keepalive_interval = 7200  # 2 hour
     friendly_name = "Node"
 
-    def __init__(self, endpoint, in_clusters, out_clusters, manufacturer, model, **kwargs):
+    def __init__(self, endpoint, in_clusters, out_clusters,
+                 manufacturer, model, application_listener, **kwargs):
         """Init ZHA node entity."""
         self._device_state_attributes = {}
         ieeetail = ''.join([
@@ -364,17 +399,23 @@ class ZhaNodeEntity(entity.Entity):
         for cluster in out_clusters.values():
             cluster.add_listener(self)
         self._device_state_attributes['ieee'] = '%s' % (endpoint.device.ieee, )
-        self._device_state_attributes['battery'] = 'unknown'
+        self._device_state_attributes['battery'] = ha_const.STATE_UNKNOWN
         self._device_state_attributes['last_update'] = datetime.datetime.now()
 
         self._endpoint = endpoint
         self._in_clusters = in_clusters
         self._out_clusters = out_clusters
-        self._state = ha_const.STATE_UNKNOWN
+        self._state = 'Online'
+
+        application_listener.register_entity(self._ieee, self)
+
+    @property
+    def state(self) -> str:
+        """Return the state of the entity."""
+        return self._state
 
     def attribute_updated(self, attribute, value):
         """Handle an attribute updated on this cluster."""
-        _LOGGER.info("Received node entity attribute: %s, %s", attribute, value)
         # xiaomi manufacturer specific attribute
         if attribute == 0xFF01 and self._manufacturer == XIAOMI:
             self._decode_xiaomi_heartbeat(value)
@@ -394,7 +435,8 @@ class ZhaNodeEntity(entity.Entity):
 
             if xiaomi_type == 0x01:
                 # I'm sure there's a more accurate way to do this
-                heartbeat['battery_percentage'] = round((value - 2600) / (3200 - 2600) * 100)
+                heartbeat['battery_percentage'] = round(
+                    (value - 2600) / (3200 - 2600) * 100)
                 self.update_battery_percent(heartbeat['battery_percentage'])
                 heartbeat['battery_voltage'] = value / 1000
             elif xiaomi_type == 0x03:
@@ -403,10 +445,10 @@ class ZhaNodeEntity(entity.Entity):
                 heartbeat['state'] = value
             else:
                 unknown[xiaomi_type] = value
-    
+
     def _decode_centralite_battery(self, value):
-        minVolts = 15
-        maxVolts = 28
+        min_volts = 15
+        max_volts = 28
         values = {
             28: 100,
             27: 100,
@@ -424,10 +466,10 @@ class ZhaNodeEntity(entity.Entity):
             15: 0
         }
 
-        if value < minVolts:
-            value = minVolts
-        elif value > maxVolts:
-            value = maxVolts
+        if value < min_volts:
+            value = min_volts
+        elif value > max_volts:
+            value = max_volts
 
         self.update_battery_percent(values.get(value, 'unknown'))
 
@@ -436,10 +478,12 @@ class ZhaNodeEntity(entity.Entity):
         self.update_last_modified()
 
     def update_last_modified(self):
+        """Update last_update attribute."""
         self._device_state_attributes['last_update'] = datetime.datetime.now()
         self.schedule_update_ha_state()
 
     def update_battery_percent(self, percent):
+        """Update battery attribute."""
         self._device_state_attributes['battery'] = '%s%%' % (percent, )
 
     @property
@@ -451,6 +495,21 @@ class ZhaNodeEntity(entity.Entity):
     def device_state_attributes(self):
         """Return device specific state attributes."""
         return self._device_state_attributes
+
+    @asyncio.coroutine
+    def async_update(self):
+        """Handle polling."""
+        difference = datetime.datetime.now(
+        ) - self._device_state_attributes['last_update']
+        if difference.total_seconds() > self._keepalive_interval:
+            self._state = 'Offline'
+        elif (self._device_state_attributes['battery'] is not
+                ha_const.STATE_UNKNOWN and
+                self._device_state_attributes['battery'][:-1] <= 15):
+            self._state = "Battery Low"
+        else:
+            self._state = 'Online'
+        self.schedule_update_ha_state()
 
 
 @asyncio.coroutine
@@ -507,11 +566,28 @@ def get_discovery_info(hass, discovery_info):
     return discovery_info
 
 
+@asyncio.coroutine
+def safe_read(cluster, attributes):
+    """Swallow all exceptions from network read.
+    If we throw during initialization, setup fails. Rather have an entity that
+    exists, but is in a maybe wrong state, than no entity. This method should
+    probably only be used during initialization.
+    """
+    try:
+        result, _ = yield from cluster.read_attributes(
+            attributes,
+            allow_cache=False,
+        )
+        return result
+    except Exception:  # pylint: disable=broad-except
+        return {}
+
+
 def get_node_entity(hass, ieee):
+    """Get node entity from ieee."""
     if ieee is None:
         return
 
     all_node_entities = hass.data.get(NODE_ENTITY_KEY, {})
     node_entity = all_node_entities.get(ieee, None)
     return node_entity
-
